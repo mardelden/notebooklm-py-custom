@@ -384,6 +384,16 @@ class RateLimitError(RPCError):
 
     Attributes:
         retry_after: Seconds to wait before retrying (if provided by API).
+        display_message: Server-supplied user-facing message extracted from the
+            UserDisplayableError payload, when available. Distinct from the
+            exception's ``str(...)`` so callers can render Google's exact text.
+        grpc_status: Bare gRPC status code from ``item[5][0]`` when the server
+            sent the ``[code, None, [[UserDisplayableError, ...]]]`` shape.
+            ``8`` is RESOURCE_EXHAUSTED (quota); transient codes (``14`` etc.)
+            usually indicate per-IP rate limiting rather than account quota.
+        error_payload: The raw decoded ``item[5]`` structure, preserved verbatim
+            for callers that want to inspect server-side error details that
+            haven't been parsed into a dedicated field yet.
     """
 
     def __init__(
@@ -395,6 +405,9 @@ class RateLimitError(RPCError):
         raw_response: str | None = None,
         rpc_code: str | int | None = None,
         found_ids: list[str] | None = None,
+        display_message: str | None = None,
+        grpc_status: int | None = None,
+        error_payload: Any | None = None,
     ):
         super().__init__(
             message,
@@ -404,6 +417,9 @@ class RateLimitError(RPCError):
             found_ids=found_ids,
         )
         self.retry_after = retry_after
+        self.display_message = display_message
+        self.grpc_status = grpc_status
+        self.error_payload = error_payload
 
 
 class ServerError(RPCError):

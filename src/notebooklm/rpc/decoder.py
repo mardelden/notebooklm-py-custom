@@ -415,6 +415,72 @@ def _contains_user_displayable_error(obj: Any) -> bool:
     return False
 
 
+def _extract_user_displayable_message(obj: Any) -> str | None:
+    """Walk an error_info structure and return the most user-facing string.
+
+    The server-side payload for the rate-limit/quota shape looks roughly like::
+
+        [8, None, [[
+            "type.googleapis.com/util.UserDisplayableError",
+            "<title>",
+            "<body>",
+            ...
+        ]]]
+
+    The strings adjacent to the ``UserDisplayableError`` marker are the
+    human-readable title and body. This helper returns them joined with a dash,
+    or ``None`` if no candidate string is found. Returning the raw text lets the
+    CLI surface the actual server message ("daily limit reached", "try again in
+    N hours", etc.) instead of a generic "rate limit" stub.
+    """
+    if isinstance(obj, list):
+        for i, child in enumerate(obj):
+            if isinstance(child, str) and "UserDisplayableError" in child:
+                # The strings immediately after the marker tend to be the
+                # display title and body. Skip enum-like ALL_CAPS tokens and
+                # numeric strings; keep prose only.
+                strings: list[str] = []
+                for sibling in obj[i + 1 : i + 6]:
+                    if not isinstance(sibling, str) or not sibling.strip():
+                        continue
+                    if sibling.isupper() and " " not in sibling:
+                        continue
+                    if sibling.replace(".", "", 1).isdigit():
+                        continue
+                    strings.append(sibling.strip())
+                    if len(strings) == 2:
+                        break
+                if strings:
+                    return " — ".join(strings)
+            nested = _extract_user_displayable_message(child)
+            if nested:
+                return nested
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            nested = _extract_user_displayable_message(v)
+            if nested:
+                return nested
+    return None
+
+
+def _extract_leading_status_code(error_info: Any) -> int | None:
+    """Return the leading int from ``error_info`` when it looks like a status code.
+
+    Unlike :func:`_extract_status_code` (which requires the bare ``[code]``
+    shape), this also matches the ``[code, None, [[UserDisplayableError, ...]]]``
+    rate-limit shape. Used to enrich :class:`RateLimitError` so callers can
+    distinguish ``8 RESOURCE_EXHAUSTED`` (quota, per account, usually per day)
+    from transient codes (``14 UNAVAILABLE``, etc.) without re-parsing item[5].
+    """
+    if not isinstance(error_info, list) or not error_info:
+        return None
+    code = error_info[0]
+    # `type(code) is int` because bool is a subclass of int.
+    if type(code) is not int or code not in _GRPC_STATUS_MESSAGES:
+        return None
+    return code
+
+
 def extract_rpc_result(chunks: list[Any], rpc_id: str) -> Any:
     """Extract result data for a specific RPC ID from chunks."""
     source = "decoder.extract_rpc_result"
@@ -466,10 +532,32 @@ def extract_rpc_result(chunks: list[Any], rpc_id: str) -> Any:
                 if result_data is None and len(item) > 5:
                     error_info = safe_index(item, 5, method_id=rpc_id, source=source)
                     if error_info is not None and _contains_user_displayable_error(error_info):
+                        display = _extract_user_displayable_message(error_info)
+                        grpc_status = _extract_leading_status_code(error_info)
+                        try:
+                            payload_preview = json.dumps(error_info, default=str)
+                        except (TypeError, ValueError):
+                            payload_preview = repr(error_info)
+                        message = display or (
+                            "API rate limit or quota exceeded. Please wait before retrying."
+                        )
+                        if grpc_status is not None:
+                            status_label = _GRPC_STATUS_MESSAGES.get(grpc_status, "")
+                            logger.debug(
+                                "UserDisplayableError for %s: gRPC %d (%s) — %s",
+                                rpc_id,
+                                grpc_status,
+                                status_label,
+                                display or "<no display message>",
+                            )
                         raise RateLimitError(
-                            "API rate limit or quota exceeded. Please wait before retrying.",
+                            message,
                             method_id=rpc_id,
                             rpc_code="USER_DISPLAYABLE_ERROR",
+                            raw_response=payload_preview,
+                            display_message=display,
+                            grpc_status=grpc_status,
+                            error_payload=error_info,
                         )
 
                 if isinstance(result_data, str):

@@ -342,6 +342,80 @@ class TestExtractRPCResult:
         assert result is None
 
 
+class TestUserDisplayableErrorEnrichment:
+    """RateLimitError must preserve enough server context for callers to
+    distinguish quota (8 RESOURCE_EXHAUSTED, per-day) from transient rate
+    limiting (other gRPC codes), and to render the server's exact message."""
+
+    def test_extracts_display_message_from_payload(self):
+        """When prose siblings sit next to the marker, surface them as the
+        exception message instead of the generic stub."""
+        error_info = [
+            8,
+            None,
+            [
+                [
+                    "type.googleapis.com/util.UserDisplayableError",
+                    "Daily quota reached",
+                    "You've used your daily limit. Try again in 8 hours.",
+                ]
+            ],
+        ]
+        chunks = [["wrb.fr", RPCMethod.LIST_NOTEBOOKS.value, None, None, None, error_info]]
+
+        with pytest.raises(RateLimitError) as exc_info:
+            extract_rpc_result(chunks, RPCMethod.LIST_NOTEBOOKS.value)
+
+        err = exc_info.value
+        assert err.display_message == (
+            "Daily quota reached — You've used your daily limit. Try again in 8 hours."
+        )
+        assert str(err) == err.display_message
+
+    def test_extracts_grpc_status_from_leading_code(self):
+        """item[5][0] should land on the exception as grpc_status."""
+        error_info = [8, None, [["UserDisplayableError", "Quota", "Try later"]]]
+        chunks = [["wrb.fr", RPCMethod.LIST_NOTEBOOKS.value, None, None, None, error_info]]
+
+        with pytest.raises(RateLimitError) as exc_info:
+            extract_rpc_result(chunks, RPCMethod.LIST_NOTEBOOKS.value)
+
+        assert exc_info.value.grpc_status == 8
+
+    def test_preserves_raw_error_payload_verbatim(self):
+        """error_payload must round-trip the decoded item[5] for callers
+        who want to inspect server fields not parsed into dedicated attrs."""
+        error_info = [8, None, [["UserDisplayableError", "T", "B", {"extra": 1}]]]
+        chunks = [["wrb.fr", RPCMethod.LIST_NOTEBOOKS.value, None, None, None, error_info]]
+
+        with pytest.raises(RateLimitError) as exc_info:
+            extract_rpc_result(chunks, RPCMethod.LIST_NOTEBOOKS.value)
+
+        assert exc_info.value.error_payload == error_info
+
+    def test_raw_response_contains_json_serialized_payload(self):
+        """raw_response should be a JSON string of item[5] (clipped per the
+        base class's preview rules) so quick logs/repr show the structure."""
+        error_info = [8, None, [["UserDisplayableError", "T", "B"]]]
+        chunks = [["wrb.fr", RPCMethod.LIST_NOTEBOOKS.value, None, None, None, error_info]]
+
+        with pytest.raises(RateLimitError) as exc_info:
+            extract_rpc_result(chunks, RPCMethod.LIST_NOTEBOOKS.value)
+
+        assert exc_info.value.raw_response is not None
+        assert "UserDisplayableError" in exc_info.value.raw_response
+
+    def test_missing_prose_falls_back_to_generic_message(self):
+        """Existing behavior: when the payload has no prose adjacent to the
+        marker, keep the historical generic message so legacy `match="rate
+        limit"` callers don't break."""
+        error_info = [8, None, [["UserDisplayableError", []]]]
+        chunks = [["wrb.fr", RPCMethod.LIST_NOTEBOOKS.value, None, None, None, error_info]]
+
+        with pytest.raises(RateLimitError, match="rate limit"):
+            extract_rpc_result(chunks, RPCMethod.LIST_NOTEBOOKS.value)
+
+
 class TestDecodeResponse:
     def test_full_decode_pipeline(self):
         """Test complete decode from raw response to result."""
